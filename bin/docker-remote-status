@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Read-only remote Docker poller for the Omarchy bar widget.
+#
+# Contract: always exits 0, always emits exactly one JSON object on stdout.
+#
+# Usage:
+#   docker-remote-status <host> <sshUser> [sshIdentityFile] [portBaseUrl] [--verbose]
+set -o pipefail
+
+HOST="${1:-}"
+SSH_USER="${2:-}"
+IDENTITY="${3:-}"
+PORT_BASE="${4:-}"
+VERBOSE=0
+
+if [[ "${5:-}" == "--verbose" ]]; then
+  VERBOSE=1
+elif [[ "${4:-}" == "--verbose" ]]; then
+  VERBOSE=1
+  PORT_BASE=""
+elif [[ "${3:-}" == "--verbose" ]]; then
+  VERBOSE=1
+  IDENTITY=""
+fi
+
+emit() {
+  jq -nc \
+    --arg host "$HOST" \
+    --arg sshUser "$SSH_USER" \
+    --arg portBaseUrl "$PORT_BASE" \
+    --argjson payload "$1" \
+    '$payload + {host:$host, sshUser:$sshUser, portBaseUrl:$portBaseUrl}'
+}
+
+emit_error() {
+  emit "$(jq -nc --arg error "$1" \
+    '{reachable:false, error:$error, daemon:"unknown", df:null, containers:[], hostStats:null}')"
+  exit 0
+}
+
+command -v docker >/dev/null 2>&1 || emit_error "docker CLI is not installed on this machine"
+command -v jq >/dev/null 2>&1 || emit_error "jq is not installed"
+
+[[ -n "$HOST" ]] || emit_error "no remote host configured"
+[[ "$HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || emit_error "invalid host"
+[[ -n "$SSH_USER" ]] || emit_error "no SSH user configured"
+[[ "$SSH_USER" =~ ^[A-Za-z0-9._-]+$ ]] || emit_error "invalid SSH user"
+[[ -z "$IDENTITY" || -f "$IDENTITY" ]] || emit_error "SSH identity file not found"
+[[ -z "$PORT_BASE" || "$PORT_BASE" =~ ^https?://[A-Za-z0-9._:-]+(:[0-9]{1,5})?$ ]] \
+  || emit_error "invalid portBaseUrl"
+
+if [[ -z "$PORT_BASE" ]]; then
+  if [[ "$HOST" =~ ^[0-9.]+$ || "$HOST" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    PORT_BASE="http://${HOST}"
+  fi
+fi
+
+ssh_target="${SSH_USER}@${HOST}"
+
+ssh_cmd=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR)
+[[ -n "$IDENTITY" ]] && ssh_cmd+=(-i "$IDENTITY")
+
+run_ssh() {
+  "${ssh_cmd[@]}" "$ssh_target" "$@"
+}
+
+run_docker() {
+  run_ssh docker "$@"
+}
+
+ids_err=$(mktemp)
+if ! ids=$(run_docker ps -aq 2>"$ids_err"); then
+  ids=$(<"$ids_err")
+  rm -f "$ids_err"
+  case "$ids" in
+    *"[Pp]ermission denied"*) emit_error "SSH permission denied for ${ssh_target}" ;;
+    *"[Nn]o route"*|*"Could not resolve"*) emit_error "SSH host unreachable: ${HOST}" ;;
+    *"[Cc]onnection refused"*) emit_error "SSH connection refused on ${HOST}" ;;
+    *"[Dd]ocker"*|*"Cannot connect"*|*"daemon"*) emit_error "Docker daemon unreachable on ${HOST}" ;;
+    *) emit_error "remote error: ${ids:0:180}" ;;
+  esac
+fi
+rm -f "$ids_err"
+
+df=null
+if (( VERBOSE )); then
+  df=$(run_docker system df --format '{{json .}}' 2>/dev/null \
+    | jq -sc 'map({type: .Type, reclaimable: .Reclaimable})' 2>/dev/null) || df=null
+  [[ -z "$df" || "$df" == "null" ]] && df=null
+fi
+
+containers='[]'
+if [[ -n "$ids" ]]; then
+  # shellcheck disable=SC2086
+  containers=$(run_docker inspect $ids 2>/dev/null | jq -c 'map({
+    id: .Id[0:12],
+    name: (.Name | ltrimstr("/")),
+    service: (.Config.Labels["com.docker.compose.service"] // ""),
+    project: (.Config.Labels["com.docker.compose.project"] // ""),
+    workingDir: (.Config.Labels["com.docker.compose.project.working_dir"] // ""),
+    configFiles: (.Config.Labels["com.docker.compose.project.config_files"] // ""),
+    image: .Config.Image,
+    state: .State.Status,
+    health: (if .State.Status == "running" then (.State.Health.Status // "") else "" end),
+    ports: ([ (.HostConfig.PortBindings // {})
+      | to_entries[]
+      | .key as $cport
+      | (.value // [])[]
+      | select((.HostPort // "") != "")
+      | {host: .HostPort, container: $cport} ]
+      | unique)
+  })' 2>/dev/null) || containers='[]'
+  [[ -z "$containers" ]] && containers='[]'
+fi
+
+host_stats='null'
+if stats_raw=$(run_ssh bash -s 2>/dev/null <<'REMOTE'
+set -euo pipefail
+mem_total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+mem_avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+mem_used=$(( (mem_total_kb - mem_avail_kb) * 1024 ))
+mem_total=$(( mem_total_kb * 1024 ))
+read -r disk_used disk_total < <(df -B1 / | awk 'NR==2 {print $3, $2}')
+cpu_idle=$(top -bn1 | awk -F'[, ]+' '/^[[:space:]]*%?[Cc]pu/ {for (i=1;i<=NF;i++) if ($(i+1)=="id") {print $(i); exit}}')
+cpu=$(awk -v id="${cpu_idle:-0}" 'BEGIN { if (id < 0 || id > 100) id=0; printf "%.4f", (100-id)/100 }')
+node=$(hostname -s 2>/dev/null || hostname)
+printf '{"node":"%s","cpu":%s,"mem_used":%s,"mem_total":%s,"disk_used":%s,"disk_total":%s}\n' \
+  "$node" "$cpu" "$mem_used" "$mem_total" "$disk_used" "$disk_total"
+REMOTE
+); then
+  host_stats=$(printf '%s' "$stats_raw" | jq -c . 2>/dev/null) || host_stats='null'
+  [[ -z "$host_stats" || "$host_stats" == "null" ]] && host_stats='null'
+fi
+
+emit "$(jq -nc \
+  --argjson df "$df" \
+  --argjson containers "$containers" \
+  --argjson hostStats "$host_stats" \
+  '{reachable:true, error:"", daemon:"running", df:$df, containers:$containers, hostStats:$hostStats}')"

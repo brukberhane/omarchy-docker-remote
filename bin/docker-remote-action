@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Run a validated Docker action on a remote host over SSH.
+#
+# Contract: always exits 0, one JSON object on stdout.
+#   success -> {"ok":true}
+#   failure -> {"error":"..."}
+#
+# Usage:
+#   docker-remote-action <host> <sshUser> <identityFile> <kind> [...]
+#
+# Kinds:
+#   container <start|stop|restart|unpause|rm> <id>
+#   stack-start <workingDir> <configFilesCsv>
+#   stack-stop  <id> [<id> ...]
+set -uo pipefail
+
+HOST="${1:-}"
+SSH_USER="${2:-}"
+IDENTITY="${3:-}"
+KIND="${4:-}"
+
+emit_error() {
+  printf '{"error":%s}\n' "$(printf '%s' "$1" | jq -Rs . 2>/dev/null || echo '"internal"')"
+  exit 0
+}
+
+emit_ok() {
+  printf '{"ok":true}\n'
+  exit 0
+}
+
+command -v jq >/dev/null 2>&1 || { printf '{"error":"jq is not installed"}\n'; exit 0; }
+command -v docker >/dev/null 2>&1 || emit_error "docker CLI is not installed on this machine"
+
+[[ -n "$HOST" && "$HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || emit_error "invalid host"
+[[ -n "$SSH_USER" && "$SSH_USER" =~ ^[A-Za-z0-9._-]+$ ]] || emit_error "invalid SSH user"
+[[ -z "$IDENTITY" || -f "$IDENTITY" ]] || emit_error "SSH identity file not found"
+[[ -n "$KIND" ]] || emit_error "missing action kind"
+
+ssh_target="${SSH_USER}@${HOST}"
+
+run_docker() {
+  local -a ssh_cmd=(ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR)
+  [[ -n "$IDENTITY" ]] && ssh_cmd+=(-i "$IDENTITY")
+  "${ssh_cmd[@]}" "$ssh_target" docker "$@"
+}
+
+case "$KIND" in
+  container)
+    ACTION="${5:-}"
+    CID="${6:-}"
+    [[ "$ACTION" =~ ^(start|stop|restart|unpause|rm)$ ]] || emit_error "invalid container action"
+    [[ "$CID" =~ ^[a-f0-9]{12,64}$ ]] || emit_error "invalid container id"
+    if ! out=$(run_docker "$ACTION" "$CID" 2>&1); then
+      emit_error "${ACTION} failed: ${out:0:200}"
+    fi
+    emit_ok
+    ;;
+
+  stack-start)
+    WORKDIR="${5:-}"
+    CONFIG_FILES="${6:-}"
+    [[ "$WORKDIR" =~ ^/[A-Za-z0-9/._-]+$ ]] || emit_error "invalid compose working directory"
+    cmd=(compose --project-directory "$WORKDIR")
+    if [[ -n "$CONFIG_FILES" ]]; then
+      IFS=',' read -r -a files <<<"$CONFIG_FILES"
+      for f in "${files[@]}"; do
+        [[ -n "$f" ]] || continue
+        [[ "$f" =~ ^/[A-Za-z0-9/._-]+$ ]] || emit_error "invalid compose file path"
+        cmd+=(-f "$f")
+      done
+    fi
+    cmd+=(up -d)
+    if ! out=$(run_docker "${cmd[@]}" 2>&1); then
+      emit_error "stack start failed: ${out:0:200}"
+    fi
+    emit_ok
+    ;;
+
+  stack-stop)
+    shift 4
+    ids=()
+    for id in "$@"; do
+      [[ "$id" =~ ^[a-f0-9]{12,64}$ ]] || emit_error "invalid container id"
+      ids+=("$id")
+    done
+    ((${#ids[@]} > 0)) || emit_error "no container ids for stack stop"
+    if ! out=$(run_docker stop "${ids[@]}" 2>&1); then
+      emit_error "stack stop failed: ${out:0:200}"
+    fi
+    emit_ok
+    ;;
+
+  *)
+    emit_error "invalid action kind: $KIND"
+    ;;
+esac

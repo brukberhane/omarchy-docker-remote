@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# Multi-host config for Docker Remote (one store per bar widget instance).
+#
+#   docker-remote-config list [instanceId]
+#   docker-remote-config add [instanceId] host=... sshUser=... [label=...] [portBaseUrl=...] [sshIdentityFile=...]
+#   docker-remote-config set-active [instanceId] <hostId>
+#   docker-remote-config remove [instanceId] <hostId>
+#   docker-remote-config update [instanceId] <hostId> key=value ...
+#
+# Legacy (updates active host):
+#   docker-remote-config get [instanceId]
+#   docker-remote-config set [instanceId] key=value ...
+set -euo pipefail
+
+CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/docker-remote"
+
+sanitize_instance() {
+  local id="${1:-default}"
+  [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "invalid instance id" >&2; exit 1; }
+  printf '%s' "$id"
+}
+
+sanitize_host_id() {
+  local id="${1:-}"
+  [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "invalid host id" >&2; exit 1; }
+  printf '%s' "$id"
+}
+
+store_file() {
+  printf '%s/%s.json' "$CONFIG_ROOT" "$(sanitize_instance "${1:-default}")"
+}
+
+legacy_conf() {
+  printf '%s/%s.conf' "$CONFIG_ROOT" "$(sanitize_instance "${1:-default}")"
+}
+
+empty_store() {
+  jq -nc '{activeId:"", hosts:[]}'
+}
+
+read_store() {
+  local instance="${1:-default}"
+  local file
+  file="$(store_file "$instance")"
+  migrate_legacy "$instance"
+  if [[ -f "$file" ]]; then
+    jq -c . "$file"
+  else
+    empty_store
+  fi
+}
+
+write_store() {
+  local instance="${1:-default}"
+  local json="${2:-}"
+  mkdir -p "$CONFIG_ROOT"
+  umask 077
+  printf '%s\n' "$json" >"$(store_file "$instance")"
+}
+
+migrate_legacy() {
+  local instance="${1:-default}"
+  local file legacy
+  file="$(store_file "$instance")"
+  legacy="$(legacy_conf "$instance")"
+  [[ -f "$file" ]] && return 0
+  [[ ! -f "$legacy" ]] && return 0
+
+  # shellcheck disable=SC1090
+  source "$legacy"
+  local host="${HOST:-}" ssh_user="${SSH_USER:-}" label="${LABEL:-}"
+  local port_base="${PORT_BASE_URL:-}" identity="${SSH_IDENTITY_FILE:-}"
+  [[ -n "$host" && -n "$ssh_user" ]] || return 0
+
+  local store
+  store=$(jq -nc \
+    --arg id "default" \
+    --arg host "$host" \
+    --arg sshUser "$ssh_user" \
+    --arg label "$label" \
+    --arg portBaseUrl "$port_base" \
+    --arg sshIdentityFile "$identity" \
+    '{activeId:$id, hosts:[{id:$id, host:$host, sshUser:$sshUser, label:$label, portBaseUrl:$portBaseUrl, sshIdentityFile:$sshIdentityFile}]}')
+  write_store "$instance" "$store"
+}
+
+parse_host_fields() {
+  HOST="" SSH_USER="" LABEL="" PORT_BASE_URL="" SSH_IDENTITY_FILE=""
+  local pair key value
+  for pair in "$@"; do
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    case "$key" in
+      host) HOST="$value" ;;
+      sshUser) SSH_USER="$value" ;;
+      label) LABEL="$value" ;;
+      portBaseUrl) PORT_BASE_URL="$value" ;;
+      sshIdentityFile) SSH_IDENTITY_FILE="$value" ;;
+      *) echo "unknown key: $key" >&2; exit 1 ;;
+    esac
+  done
+}
+
+validate_host_fields() {
+  [[ "$HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || { echo "invalid host" >&2; exit 1; }
+  [[ -n "$SSH_USER" && "$SSH_USER" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "invalid sshUser" >&2; exit 1; }
+  [[ -z "$PORT_BASE_URL" || "$PORT_BASE_URL" =~ ^https?://[A-Za-z0-9._:-]+(:[0-9]{1,5})?$ ]] \
+    || { echo "invalid portBaseUrl" >&2; exit 1; }
+  [[ -z "$SSH_IDENTITY_FILE" || -f "$SSH_IDENTITY_FILE" ]] \
+    || { echo "identity file not found: $SSH_IDENTITY_FILE" >&2; exit 1; }
+}
+
+new_host_id() {
+  local seed="${1:-host}"
+  seed=$(printf '%s' "$seed" | tr ':/.' '---' | tr -cd 'A-Za-z0-9._-' | cut -c1-24)
+  [[ -n "$seed" ]] || seed="host"
+  local store="$2" n=1 id="$seed"
+  while jq -e --arg id "$id" '.hosts[] | select(.id == $id)' <<<"$store" >/dev/null 2>&1; do
+    id="${seed}-${n}"
+    n=$((n + 1))
+  done
+  printf '%s' "$id"
+}
+
+cmd_list() {
+  read_store "${1:-default}"
+}
+
+cmd_get() {
+  local instance="${1:-default}"
+  local store active
+  store=$(read_store "$instance")
+  active=$(jq -r '.activeId // empty' <<<"$store")
+  [[ -n "$active" ]] || { empty_store; exit 0; }
+  jq -c --arg id "$active" '.hosts[] | select(.id == $id)' <<<"$store" | head -1
+  [[ ${PIPESTATUS[0]} -eq 0 ]] || empty_store
+}
+
+cmd_set_active() {
+  local instance="${1:-default}"
+  local host_id="${2:-}"
+  sanitize_host_id "$host_id" >/dev/null
+  local store
+  store=$(read_store "$instance")
+  jq -e --arg id "$host_id" '.hosts[] | select(.id == $id)' <<<"$store" >/dev/null \
+    || { echo "unknown host id: $host_id" >&2; exit 1; }
+  store=$(jq -c --arg id "$host_id" '.activeId = $id' <<<"$store")
+  write_store "$instance" "$store"
+  cmd_list "$instance"
+}
+
+cmd_add() {
+  local instance="${1:-default}"
+  shift || true
+  [[ $# -gt 0 ]] || { echo "usage: add [instance] host=... sshUser=..." >&2; exit 1; }
+  parse_host_fields "$@"
+  validate_host_fields
+
+  local store id entry
+  store=$(read_store "$instance")
+  id=$(new_host_id "${LABEL:-$HOST}" "$store")
+  entry=$(jq -nc \
+    --arg id "$id" \
+    --arg host "$HOST" \
+    --arg sshUser "$SSH_USER" \
+    --arg label "$LABEL" \
+    --arg portBaseUrl "$PORT_BASE_URL" \
+    --arg sshIdentityFile "$SSH_IDENTITY_FILE" \
+    '{id:$id, host:$host, sshUser:$sshUser, label:$label, portBaseUrl:$portBaseUrl, sshIdentityFile:$sshIdentityFile}')
+
+  store=$(jq -c --argjson entry "$entry" '.hosts += [$entry] | .activeId = $entry.id' <<<"$store")
+  write_store "$instance" "$store"
+  cmd_list "$instance"
+}
+
+cmd_update() {
+  local instance="${1:-default}"
+  local host_id="${2:-}"
+  shift 2 || true
+  sanitize_host_id "$host_id" >/dev/null
+  [[ $# -gt 0 ]] || { echo "usage: update [instance] <hostId> key=value ..." >&2; exit 1; }
+
+  parse_host_fields "$@"
+  local store
+  store=$(read_store "$instance")
+  jq -e --arg id "$host_id" '.hosts[] | select(.id == $id)' <<<"$store" >/dev/null \
+    || { echo "unknown host id: $host_id" >&2; exit 1; }
+
+  local cur
+  cur=$(jq -c --arg id "$host_id" '.hosts[] | select(.id == $id)' <<<"$store")
+  HOST=$(jq -r '.host' <<<"$cur")
+  SSH_USER=$(jq -r '.sshUser' <<<"$cur")
+  LABEL=$(jq -r '.label // ""' <<<"$cur")
+  PORT_BASE_URL=$(jq -r '.portBaseUrl // ""' <<<"$cur")
+  SSH_IDENTITY_FILE=$(jq -r '.sshIdentityFile // ""' <<<"$cur")
+  parse_host_fields "$@"
+  validate_host_fields
+
+  local updated
+  updated=$(jq -nc \
+    --arg id "$host_id" \
+    --arg host "$HOST" \
+    --arg sshUser "$SSH_USER" \
+    --arg label "$LABEL" \
+    --arg portBaseUrl "$PORT_BASE_URL" \
+    --arg sshIdentityFile "$SSH_IDENTITY_FILE" \
+    '{id:$id, host:$host, sshUser:$sshUser, label:$label, portBaseUrl:$portBaseUrl, sshIdentityFile:$sshIdentityFile}')
+
+  store=$(jq -c --arg id "$host_id" --argjson entry "$updated" \
+    '.hosts = [.hosts[] | if .id == $id then $entry else . end]' <<<"$store")
+  write_store "$instance" "$store"
+  cmd_list "$instance"
+}
+
+cmd_remove() {
+  local instance="${1:-default}"
+  local host_id="${2:-}"
+  sanitize_host_id "$host_id" >/dev/null
+  local store
+  store=$(read_store "$instance")
+  store=$(jq -c --arg id "$host_id" '
+    .hosts = [.hosts[] | select(.id != $id)]
+    | if .activeId == $id then .activeId = (.hosts[0].id // "") else . end
+  ' <<<"$store")
+  write_store "$instance" "$store"
+  cmd_list "$instance"
+}
+
+cmd_set() {
+  local instance="${1:-default}"
+  shift || true
+  [[ $# -gt 0 ]] || { echo "usage: set [instance] key=value ..." >&2; exit 1; }
+  local store active
+  store=$(read_store "$instance")
+  active=$(jq -r '.activeId // empty' <<<"$store")
+  if [[ -z "$active" ]]; then
+    cmd_add "$instance" "$@"
+    return
+  fi
+  cmd_update "$instance" "$active" "$@"
+}
+
+command -v jq >/dev/null 2>&1 || { echo '{"error":"jq is not installed"}'; exit 0; }
+
+case "${1:-}" in
+  list)
+    shift
+    cmd_list "${1:-default}"
+    ;;
+  get)
+    shift
+    cmd_get "${1:-default}"
+    ;;
+  add)
+    shift
+    instance="${1:-default}"
+    if [[ "$instance" == *=* ]]; then
+      cmd_add "default" "$instance" "${@:2}"
+    else
+      shift
+      cmd_add "$instance" "$@"
+    fi
+    ;;
+  set-active)
+    shift
+    cmd_set_active "${1:-default}" "${2:-}"
+    ;;
+  remove)
+    shift
+    cmd_remove "${1:-default}" "${2:-}"
+    ;;
+  update)
+    shift
+    cmd_update "$@"
+    ;;
+  set)
+    shift
+    instance="${1:-default}"
+    if [[ "$instance" == *=* ]]; then
+      cmd_set "default" "$instance" "${@:2}"
+    else
+      shift
+      cmd_set "$instance" "$@"
+    fi
+    ;;
+  *)
+    echo "usage: docker-remote-config list|get|add|set-active|remove|update|set ..." >&2
+    exit 1
+    ;;
+esac
