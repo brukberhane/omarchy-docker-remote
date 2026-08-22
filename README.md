@@ -56,19 +56,12 @@ On each **remote host**:
 
 ## Install
 
-From a local clone:
-
 ```bash
-omarchy plugin add /path/to/omarchy-docker-remote --enable
-```
-
-From Git (once published):
-
-```bash
-omarchy plugin add https://github.com/brukb/omarchy-docker-remote.git --enable
+omarchy plugin add https://github.com/brukberhane/omarchy-docker-remote.git --enable
 ```
 
 Add to `~/.config/omarchy/shell.json` (example: left bar, after Proxmarchy):
+
 
 ```json
 {
